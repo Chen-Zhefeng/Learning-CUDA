@@ -19,7 +19,11 @@ EXTRA_LIBS     	:=
 
 # Compiler & Tester object selection based on PLATFORM
 ifeq ($(PLATFORM),nvidia)
-    CC          	:= nvcc
+    # Prefer nvcc from PATH; fall back to common CUDA install locations.
+    CC          	:= $(or $(shell command -v nvcc 2>/dev/null),$(firstword $(wildcard /usr/local/cuda/bin/nvcc /usr/local/cuda-*/bin/nvcc)))
+	ifeq ($(CC),)
+		$(error nvcc not found. Add CUDA to PATH or install CUDA Toolkit. Tried PATH and /usr/local/cuda*/bin/nvcc)
+	endif
     TEST_OBJ    	:= tester/tester_nv.o
 	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
 else ifeq ($(PLATFORM),iluvatar)
