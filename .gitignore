@@ -1,0 +1,10 @@
+# Objects
+*.o
+src/*.o
+
+# Binaries
+test_kernels
+test_trace
+
+# Editor
+.vscode/
