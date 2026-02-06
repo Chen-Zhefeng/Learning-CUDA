@@ -67,7 +67,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols)
   int blocks = static_cast<int>((diag_len + threads - 1) / threads);
   if (blocks > 1024) blocks = 1024;
 
-  traceKernel<T> << <blocks, threads, static_cast<size_t>(threads) * sizeof(T) >> > (
+  traceKernel<T> <<<blocks, threads, static_cast<size_t>(threads) * sizeof(T) >>> (
     d_input, cols, diag_len, d_out);
   RUNTIME_CHECK(GPU_GET_LAST_ERROR());
   RUNTIME_CHECK(GPU_DEVICE_SYNCHRONIZE());
@@ -604,7 +604,7 @@ struct FlashAttentionLauncher
   {
     const size_t shared_bytes = static_cast<size_t>(threads + head_dim) *
       sizeof(typename ComputeType<T>::type);
-    flashAttentionKernel<T> << <blocks, threads, shared_bytes >> > (
+    flashAttentionKernel<T> <<<blocks, threads, shared_bytes >>> (
       d_q, d_k, d_v, d_o,
       batch_size, target_seq_len, src_seq_len,
       query_heads, kv_heads, head_dim, is_causal);
@@ -626,7 +626,7 @@ struct FlashAttentionLauncher<float>
     if (threads_f > 1024) threads_f = 1024;
 
     const size_t smem_bytes = (static_cast<size_t>(head_dim) + static_cast<size_t>(threads_f)) * sizeof(float);
-    flashAttentionKernelFloatOpt << <blocks, threads_f, smem_bytes >> > (
+    flashAttentionKernelFloatOpt <<<blocks, threads_f, smem_bytes >>> (
       d_q, d_k, d_v, d_o,
       batch_size, target_seq_len, src_seq_len,
       query_heads, kv_heads, head_dim, is_causal);

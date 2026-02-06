@@ -612,7 +612,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols)
   int blocks = static_cast<int>((diag_len + threads - 1) / threads);
   if (blocks > 1024) blocks = 1024;
 
-  traceKernel<T> << <blocks, threads, threads * sizeof(T) >> > (d_input, cols,
+  traceKernel<T> <<<blocks, threads, threads * sizeof(T) >>> (d_input, cols,
     diag_len, d_out);
   RUNTIME_CHECK(cudaGetLastError());
   RUNTIME_CHECK(cudaDeviceSynchronize());
@@ -702,7 +702,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     if (threads_float > 1024) threads_float = 1024;
 
     size_t smem_bytes = (static_cast<size_t>(head_dim) + static_cast<size_t>(threads_float)) * sizeof(float);
-    flashAttentionKernelFloatOpt << <blocks, threads_float, smem_bytes >> > (
+    flashAttentionKernelFloatOpt <<<blocks, threads_float, smem_bytes >>> (
       (float*)d_q, (float*)d_k, (float*)d_v, (float*)d_o,
       batch_size, target_seq_len, src_seq_len,
       query_heads, kv_heads, head_dim, is_causal);
@@ -710,7 +710,7 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   else
   {
     const size_t shared_bytes = static_cast<size_t>(threads_generic + head_dim) * sizeof(typename ComputeType<T>::type);
-    flashAttentionKernel<T> << <blocks, threads_generic, shared_bytes >> > (
+    flashAttentionKernel<T> <<<blocks, threads_generic, shared_bytes >>> (
       d_q, d_k, d_v, d_o,
       batch_size, target_seq_len, src_seq_len,
       query_heads, kv_heads, head_dim, is_causal);
