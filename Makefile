@@ -27,20 +27,32 @@ ifeq ($(PLATFORM),nvidia)
     TEST_OBJ    	:= tester/tester_nv.o
 	PLATFORM_DEFINE := -DPLATFORM_NVIDIA
 else ifeq ($(PLATFORM),iluvatar)
-    CC          	:= clang++
+	# Prefer clang++ from PATH; fall back to common CoreX install locations.
+	CC          	:= $(or $(shell command -v clang++ 2>/dev/null),$(firstword $(wildcard /usr/local/corex/bin/clang++ /usr/local/corex/bin/clang++-* /opt/corex/bin/clang++ /opt/corex/bin/clang++-*)))
+	ifeq ($(CC),)
+		$(error clang++ not found for Iluvatar build. Add CoreX clang++ to PATH or install CoreX toolchain.)
+	endif
 	CFLAGS          := -std=c++17 -O3
     TEST_OBJ    	:= tester/tester_iluvatar.o
 	PLATFORM_DEFINE := -DPLATFORM_ILUVATAR
 	EXTRA_LIBS		:= -lcudart -I/usr/local/corex/include -L/usr/local/corex/lib64 -fPIC
 else ifeq ($(PLATFORM),moore)
-    CC          	:= mcc
+	# Prefer mcc from PATH; fall back to common MUSA install locations.
+	CC          	:= $(or $(shell command -v mcc 2>/dev/null),$(firstword $(wildcard /usr/local/musa/bin/mcc /opt/musa/bin/mcc)))
+	ifeq ($(CC),)
+		$(error mcc not found for Moore Threads build. Add MUSA mcc to PATH or install MUSA toolchain.)
+	endif
 	CFLAGS          := -std=c++11 -O3
     TEST_OBJ    	:= tester/tester_moore.o
 	STUDENT_SUFFIX  := mu
 	PLATFORM_DEFINE := -DPLATFORM_MOORE
 	EXTRA_LIBS		:= -I/usr/local/musa/include -L/usr/lib/gcc/x86_64-linux-gnu/11/ -L/usr/local/musa/lib -lmusart
 else ifeq ($(PLATFORM),metax)
-    CC          	:= mxcc
+	# Prefer mxcc from PATH; fall back to common MetaX install locations.
+	CC          	:= $(or $(shell command -v mxcc 2>/dev/null),$(firstword $(wildcard /usr/local/mx/bin/mxcc /opt/mx/bin/mxcc /usr/local/metax/bin/mxcc /opt/metax/bin/mxcc)))
+	ifeq ($(CC),)
+		$(error mxcc not found for MetaX build. Add mxcc to PATH or install MetaX toolchain.)
+	endif
     TEST_OBJ    	:= tester/tester_metax.o
 	STUDENT_SUFFIX  := maca
 	PLATFORM_DEFINE := -DPLATFORM_METAX

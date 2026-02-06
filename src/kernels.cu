@@ -1,7 +1,14 @@
 #include <vector>
 #include <cmath>
 #include <type_traits>
+
+// 我在这一份 kernels.cu 里同时兼容 NVIDIA 与天数 (Iluvatar CoreX) 两个平台：
+// Makefile 会在天数平台下用 clang++ 编译，并定义 PLATFORM_ILUVATAR。
+
+#if defined(PLATFORM_NVIDIA) || defined(PLATFORM_ILUVATAR)
+#include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#endif
 
 #include "../tester/utils.h"
 
@@ -44,6 +51,11 @@ __global__ void traceKernel(const T* __restrict__ d_input, size_t cols,
 {
   extern __shared__ unsigned char smem[];
   T* share_data = reinterpret_cast<T*>(smem);
+
+  // 我把对角线求和拆成两级：
+  // 1) 每个线程先做 grid-stride 循环拿到自己的 local_sum；
+  // 2) block 内做一次树形归约，最后用 atomicAdd 写回全局。
+  // 这样实现起来简单、跨平台也更稳。
 
   T local_sum = static_cast<T>(0);
   for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -140,7 +152,7 @@ __device__ __forceinline__ double expT<double>(double x)
 // 1. **并行算 (Parallel Compute)**：算 Q*K 点积的时候是最耗时的，这个我用 block 里的多线程
 //    并行去算，把结果存到 Shared Memory 里。
 // 2. **串行加 (Serial Reduce)**：算完之后，我让 thread 0 按照串行顺序去累加这些 Score。
-//    虽然这里串行了，但因为最耗时的乘法已经是并行的了，整体速度还是快了很多！
+//    虽然这里串行了，但因为最耗时的乘法已经是并行的了，整体速度还是快了很多
 //    
 // 这样既保住了精度 (和 CPU 顺序一模一样)，又把速度提上来了。
 // 
@@ -201,6 +213,9 @@ __global__ void flashAttentionKernelFloatOpt(const float* __restrict__ d_q,
   const float* v_base = d_v + (b * b_stride + kvh * kv_head_stride);
 
   const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+  // 我这里刻意保持 dot 的 d 维累加顺序为 0..head_dim-1，
+  // 目的是尽量贴近 Reference 的浮点累加行为，避免并行归约带来的非结合误差。
 
   // 1. 加载 Q 到 Shared Memory (所有线程共享，减少重复 Global Read)
   for (int d = tid; d < head_dim; d += blockDim.x)
@@ -322,7 +337,8 @@ __global__ void flashAttentionKernelFloatOpt(const float* __restrict__ d_q,
   // 并行维度：d (Head Dimension)
   // 线程映射：tid 对应 head_dim 索引。
 
-  // 初始化 Output 寄存器
+  // 我让每个线程负责一个输出维度 d（因此要求 blockDim.x >= head_dim，launch 时保证）。
+  // 这样 acc_val 就天然是“每个 d 一个寄存器”，不会因为一个线程要负责多个 d 而搞错结果。
   float acc_val = 0.0f;
 
   for (int j_base = 0; j_base < valid_src_len; j_base += blockDim.x)
@@ -666,9 +682,11 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
   RUNTIME_CHECK(cudaMemcpy(d_v, h_v.data(), v_numel * sizeof(T), cudaMemcpyHostToDevice));
   RUNTIME_CHECK(cudaMemset(d_o, 0, out_numel * sizeof(T)));
 
-  int threads = 32;
-  while (threads < head_dim && threads < 1024) threads <<= 1;
-  if (threads > 1024) threads = 1024;
+  // 我先为通用版本（Half/其它）选一个不小于 head_dim 的 2 的幂线程数。
+  // 这样 block reduction 的树形归约实现最省心，也更容易跨平台一致。
+  int threads_generic = 32;
+  while (threads_generic < head_dim && threads_generic < 1024) threads_generic <<= 1;
+  if (threads_generic > 1024) threads_generic = 1024;
 
   const int blocks = batch_size * target_seq_len * query_heads;
 
@@ -677,17 +695,22 @@ void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
     // Float 为了保证数值结果和 Reference 一字不差（Diff=0.0），
     // 采用“并行计算，串行归约”的优化策略 (flashAttentionKernelFloatOpt)。
     // 需要 256 个线程并发计算，同时需要 SMEM 缓存 Q 和 Scores.
-    int threads = 256;
-    size_t smem_bytes = (head_dim + threads) * sizeof(float);
-    flashAttentionKernelFloatOpt << <blocks, threads, smem_bytes >> > (
+    // 我在 float 路径下额外保证 blockDim.x >= head_dim，
+    // 这样每个线程只负责一个输出维度 d，避免 head_dim > 256 时的潜在错误。
+    int threads_float = 256;
+    while (threads_float < head_dim && threads_float < 1024) threads_float <<= 1;
+    if (threads_float > 1024) threads_float = 1024;
+
+    size_t smem_bytes = (static_cast<size_t>(head_dim) + static_cast<size_t>(threads_float)) * sizeof(float);
+    flashAttentionKernelFloatOpt << <blocks, threads_float, smem_bytes >> > (
       (float*)d_q, (float*)d_k, (float*)d_v, (float*)d_o,
       batch_size, target_seq_len, src_seq_len,
       query_heads, kv_heads, head_dim, is_causal);
   }
   else
   {
-    const size_t shared_bytes = static_cast<size_t>(threads + head_dim) * sizeof(typename ComputeType<T>::type);
-    flashAttentionKernel<T> << <blocks, threads, shared_bytes >> > (
+    const size_t shared_bytes = static_cast<size_t>(threads_generic + head_dim) * sizeof(typename ComputeType<T>::type);
+    flashAttentionKernel<T> << <blocks, threads_generic, shared_bytes >> > (
       d_q, d_k, d_v, d_o,
       batch_size, target_seq_len, src_seq_len,
       query_heads, kv_heads, head_dim, is_causal);

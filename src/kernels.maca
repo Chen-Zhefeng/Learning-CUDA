@@ -1,7 +1,25 @@
 #include <vector>
+#include <cmath>
+#include <type_traits>
 #include <common/maca_fp16.h>
 
 #include "../tester/utils.h"
+
+#define GPU_MALLOC mcMalloc
+#define GPU_FREE mcFree
+#define GPU_MEMCPY mcMemcpy
+#define GPU_MEMSET mcMemset
+#define GPU_MEMCPY_H2D mcMemcpyHostToDevice
+#define GPU_MEMCPY_D2H mcMemcpyDeviceToHost
+#define GPU_GET_LAST_ERROR mcGetLastError
+#define GPU_DEVICE_SYNCHRONIZE mcDeviceSynchronize
+
+template <typename T>
+__global__ void traceKernel(const T* __restrict__ d_input, size_t cols,
+  size_t diag_len, T* __restrict__ d_out);
+
+template <typename T>
+struct FlashAttentionLauncher;
 
 /**
  * @brief Computes the trace of a matrix.
@@ -18,14 +36,40 @@
  * @return The trace (sum of diagonal values) of the matrix.
  */
 template <typename T>
-T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
-  // TODO: Implement the trace function
-  return T(-1);
+T trace(const std::vector<T>& h_input, size_t rows, size_t cols)
+{
+  if (rows == 0 || cols == 0) return static_cast<T>(0);
+  const size_t diag_len = (rows < cols) ? rows : cols;
+  if (diag_len == 0) return static_cast<T>(0);
+
+  T* d_input = nullptr;
+  T* d_out = nullptr;
+  const size_t numel = rows * cols;
+
+  RUNTIME_CHECK(GPU_MALLOC(&d_input, numel * sizeof(T)));
+  RUNTIME_CHECK(GPU_MALLOC(&d_out, sizeof(T)));
+  RUNTIME_CHECK(GPU_MEMCPY(d_input, h_input.data(), numel * sizeof(T), GPU_MEMCPY_H2D));
+  RUNTIME_CHECK(GPU_MEMSET(d_out, 0, sizeof(T)));
+
+  const int threads = 256;
+  int blocks = static_cast<int>((diag_len + threads - 1) / threads);
+  if (blocks > 1024) blocks = 1024;
+
+  traceKernel<T> << <blocks, threads, static_cast<size_t>(threads) * sizeof(T) >> > (
+    d_input, cols, diag_len, d_out);
+  RUNTIME_CHECK(GPU_GET_LAST_ERROR());
+  RUNTIME_CHECK(GPU_DEVICE_SYNCHRONIZE());
+
+  T h_out = static_cast<T>(0);
+  RUNTIME_CHECK(GPU_MEMCPY(&h_out, d_out, sizeof(T), GPU_MEMCPY_D2H));
+  RUNTIME_CHECK(GPU_FREE(d_input));
+  RUNTIME_CHECK(GPU_FREE(d_out));
+  return h_out;
 }
 
 /**
  * @brief Computes flash attention for given query, key, and value tensors.
- * 
+ *
  * @tparam T Data type (float) for input/output tensors
  * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
@@ -33,7 +77,7 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
  * @param[in] batch_size Batch dimension size
  * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length  
+ * @param[in] src_seq_len Source sequence length
  * @param[in] query_heads Number of query attention heads
  * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
  * @param[in] head_dim Dimension size of each attention head
@@ -41,10 +85,528 @@ T trace(const std::vector<T>& h_input, size_t rows, size_t cols) {
  */
 template <typename T>
 void flashAttention(const std::vector<T>& h_q, const std::vector<T>& h_k,
-                    const std::vector<T>& h_v, std::vector<T>& h_o,
-                    int batch_size, int target_seq_len, int src_seq_len, 
-                    int query_heads, int kv_heads, int head_dim, bool is_causal) {       
+  const std::vector<T>& h_v, std::vector<T>& h_o,
+  int batch_size, int target_seq_len, int src_seq_len,
+  int query_heads, int kv_heads, int head_dim, bool is_causal)
+{
+  const size_t out_numel = static_cast<size_t>(batch_size) * target_seq_len * query_heads * head_dim;
+  if (h_o.size() != out_numel) h_o.resize(out_numel);
+
+  if (batch_size <= 0 || target_seq_len <= 0 || src_seq_len <= 0 ||
+    query_heads <= 0 || kv_heads <= 0 || head_dim <= 0)
+  {
+    for (size_t i = 0; i < out_numel; ++i) h_o[i] = static_cast<T>(0);
+    return;
+  }
+
+  const size_t q_numel = static_cast<size_t>(batch_size) * target_seq_len * query_heads * head_dim;
+  const size_t k_numel = static_cast<size_t>(batch_size) * src_seq_len * kv_heads * head_dim;
+  const size_t v_numel = static_cast<size_t>(batch_size) * src_seq_len * kv_heads * head_dim;
+
+  if (h_q.size() < q_numel || h_k.size() < k_numel || h_v.size() < v_numel)
+  {
+    for (size_t i = 0; i < out_numel; ++i) h_o[i] = static_cast<T>(0);
+    return;
+  }
+
+  T* d_q = nullptr;
+  T* d_k = nullptr;
+  T* d_v = nullptr;
+  T* d_o = nullptr;
+
+  RUNTIME_CHECK(GPU_MALLOC(&d_q, q_numel * sizeof(T)));
+  RUNTIME_CHECK(GPU_MALLOC(&d_k, k_numel * sizeof(T)));
+  RUNTIME_CHECK(GPU_MALLOC(&d_v, v_numel * sizeof(T)));
+  RUNTIME_CHECK(GPU_MALLOC(&d_o, out_numel * sizeof(T)));
+
+  RUNTIME_CHECK(GPU_MEMCPY(d_q, h_q.data(), q_numel * sizeof(T), GPU_MEMCPY_H2D));
+  RUNTIME_CHECK(GPU_MEMCPY(d_k, h_k.data(), k_numel * sizeof(T), GPU_MEMCPY_H2D));
+  RUNTIME_CHECK(GPU_MEMCPY(d_v, h_v.data(), v_numel * sizeof(T), GPU_MEMCPY_H2D));
+  RUNTIME_CHECK(GPU_MEMSET(d_o, 0, out_numel * sizeof(T)));
+
+  int threads = 32;
+  while (threads < head_dim && threads < 1024) threads <<= 1;
+  if (threads > 1024) threads = 1024;
+
+  const int blocks = batch_size * target_seq_len * query_heads;
+
+  FlashAttentionLauncher<T>::launch(
+    d_q, d_k, d_v, d_o,
+    batch_size, target_seq_len, src_seq_len,
+    query_heads, kv_heads, head_dim, is_causal,
+    threads, blocks);
+
+  RUNTIME_CHECK(GPU_GET_LAST_ERROR());
+  RUNTIME_CHECK(GPU_DEVICE_SYNCHRONIZE());
+
+  RUNTIME_CHECK(GPU_MEMCPY(h_o.data(), d_o, out_numel * sizeof(T), GPU_MEMCPY_D2H));
+  RUNTIME_CHECK(GPU_FREE(d_q));
+  RUNTIME_CHECK(GPU_FREE(d_k));
+  RUNTIME_CHECK(GPU_FREE(d_v));
+  RUNTIME_CHECK(GPU_FREE(d_o));
 }
+
+// ------------------------------------------------------------
+// Device code (Trace + FlashAttention)
+// ------------------------------------------------------------
+
+template <typename T>
+__device__ __forceinline__ void atomicAddT(T* addr, T val);
+
+template <>
+__device__ __forceinline__ void atomicAddT<int>(int* addr, int val)
+{
+  atomicAdd(addr, val);
+}
+
+template <>
+__device__ __forceinline__ void atomicAddT<float>(float* addr, float val)
+{
+  atomicAdd(addr, val);
+}
+
+template <typename T>
+__global__ void traceKernel(const T* __restrict__ d_input, size_t cols,
+  size_t diag_len, T* __restrict__ d_out)
+{
+  extern __shared__ unsigned char smem[];
+  T* share_data = reinterpret_cast<T*>(smem);
+
+  T local_sum = static_cast<T>(0);
+  for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    i < diag_len;
+    i += static_cast<size_t>(gridDim.x) * blockDim.x)
+  {
+    local_sum += d_input[i * cols + i];
+  }
+
+  share_data[threadIdx.x] = local_sum;
+  __syncthreads();
+
+  for (unsigned int s = blockDim.x >> 1; s > 0; s >>= 1)
+  {
+    if (threadIdx.x < s)
+    {
+      share_data[threadIdx.x] += share_data[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0)
+  {
+    atomicAddT<T>(d_out, share_data[0]);
+  }
+}
+
+template <typename T>
+__device__ __forceinline__ float to_float(T v)
+{
+  return static_cast<float>(v);
+}
+
+template <>
+__device__ __forceinline__ float to_float<half>(half v)
+{
+  return __half2float(v);
+}
+
+template <typename T>
+__device__ __forceinline__ T from_float(float v)
+{
+  return static_cast<T>(v);
+}
+
+template <>
+__device__ __forceinline__ half from_float<half>(float v)
+{
+  return __float2half_rn(v);
+}
+
+template <typename T>
+struct ComputeType
+{
+  using type = float;
+};
+
+template <>
+struct ComputeType<float>
+{
+  using type = float;
+};
+
+template <typename U>
+__device__ __forceinline__ U expT(U x);
+
+template <>
+__device__ __forceinline__ float expT<float>(float x)
+{
+  return expf(x);
+}
+
+template <>
+__device__ __forceinline__ double expT<double>(double x)
+{
+  return exp(x);
+}
+
+__global__ void flashAttentionKernelFloatOpt(const float* __restrict__ d_q,
+  const float* __restrict__ d_k,
+  const float* __restrict__ d_v,
+  float* __restrict__ d_o,
+  int batch_size,
+  int target_seq_len,
+  int src_seq_len,
+  int query_heads,
+  int kv_heads,
+  int head_dim,
+  bool is_causal)
+{
+  extern __shared__ unsigned char smem_raw[];
+  float* s_q = reinterpret_cast<float*>(smem_raw);
+  float* s_scores = s_q + head_dim;
+
+  const int tid = threadIdx.x;
+  const int out_idx = static_cast<int>(blockIdx.x);
+
+  const int qh_stride = query_heads;
+  const int t_stride = target_seq_len * qh_stride;
+  const int b = out_idx / t_stride;
+  const int rem0 = out_idx - b * t_stride;
+  const int t = rem0 / qh_stride;
+  const int qh = rem0 - t * qh_stride;
+
+  if (b >= batch_size) return;
+
+  int kvh = (query_heads > 0) ? ((qh * kv_heads) / query_heads) : 0;
+  if (kvh >= kv_heads) kvh = kv_heads - 1;
+
+  int valid_src_len = src_seq_len;
+  if (is_causal)
+  {
+    int visible_len = t + 1;
+    if (visible_len < valid_src_len) valid_src_len = visible_len;
+  }
+  if (valid_src_len <= 0) return;
+
+  const int q_offset = ((b * target_seq_len + t) * query_heads + qh) * head_dim;
+  const float* q_ptr = d_q + q_offset;
+  float* o_ptr = d_o + q_offset;
+
+  const int kv_head_stride = head_dim;
+  const int src_len_stride = kv_heads * head_dim;
+  const int b_stride = src_seq_len * src_len_stride;
+  const float* k_base = d_k + (b * b_stride + kvh * kv_head_stride);
+  const float* v_base = d_v + (b * b_stride + kvh * kv_head_stride);
+
+  const float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
+
+  for (int d = tid; d < head_dim; d += blockDim.x)
+  {
+    s_q[d] = q_ptr[d];
+  }
+  __syncthreads();
+
+  __shared__ float s_global_max_shared;
+  __shared__ float s_inv_sum_shared;
+
+  float global_max = -INFINITY;
+  for (int j_base = 0; j_base < valid_src_len; j_base += blockDim.x)
+  {
+    int my_j = j_base + tid;
+    float my_score = -INFINITY;
+
+    if (my_j < valid_src_len)
+    {
+      const float* k_ptr = k_base + my_j * src_len_stride;
+      float dot = 0.0f;
+      for (int d = 0; d < head_dim; ++d)
+      {
+        dot += s_q[d] * k_ptr[d];
+      }
+      my_score = dot * scale;
+    }
+
+    s_scores[tid] = my_score;
+    __syncthreads();
+
+    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1)
+    {
+      if (tid < offset)
+      {
+        float other = s_scores[tid + offset];
+        if (other > s_scores[tid]) s_scores[tid] = other;
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0)
+    {
+      if (s_scores[0] > global_max) global_max = s_scores[0];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) s_global_max_shared = global_max;
+  __syncthreads();
+  global_max = s_global_max_shared;
+
+  float sum_exp = 0.0f;
+  for (int j_base = 0; j_base < valid_src_len; j_base += blockDim.x)
+  {
+    int my_j = j_base + tid;
+    float my_score = 0.0f;
+    if (my_j < valid_src_len)
+    {
+      const float* k_ptr = k_base + my_j * src_len_stride;
+      float dot = 0.0f;
+      for (int d = 0; d < head_dim; ++d)
+      {
+        dot += s_q[d] * k_ptr[d];
+      }
+      my_score = dot * scale;
+    }
+    s_scores[tid] = my_score;
+    __syncthreads();
+
+    if (tid == 0)
+    {
+      int limit = (valid_src_len - j_base < blockDim.x) ? (valid_src_len - j_base) : blockDim.x;
+      for (int k = 0; k < limit; ++k)
+      {
+        sum_exp += expf(s_scores[k] - global_max);
+      }
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0)
+  {
+    s_inv_sum_shared = (sum_exp > 0.0f) ? (1.0f / sum_exp) : 0.0f;
+  }
+  __syncthreads();
+  float inv_sum = s_inv_sum_shared;
+
+  float acc_val = 0.0f;
+  for (int j_base = 0; j_base < valid_src_len; j_base += blockDim.x)
+  {
+    int my_j = j_base + tid;
+    float my_score = 0.0f;
+    if (my_j < valid_src_len)
+    {
+      const float* k_ptr = k_base + my_j * src_len_stride;
+      float dot = 0.0f;
+      for (int d = 0; d < head_dim; ++d)
+      {
+        dot += s_q[d] * k_ptr[d];
+      }
+      my_score = dot * scale;
+    }
+    s_scores[tid] = my_score;
+    __syncthreads();
+
+    for (int d = tid; d < head_dim; d += blockDim.x)
+    {
+      int limit = (valid_src_len - j_base < blockDim.x) ? (valid_src_len - j_base) : blockDim.x;
+      for (int k = 0; k < limit; ++k)
+      {
+        float score = s_scores[k];
+        float weight = expf(score - global_max) * inv_sum;
+        float val_v = v_base[(j_base + k) * src_len_stride + d];
+        acc_val += weight * val_v;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (int d = tid; d < head_dim; d += blockDim.x)
+  {
+    o_ptr[d] = acc_val;
+  }
+}
+
+template <typename T>
+__global__ void flashAttentionKernel(const T* __restrict__ d_q,
+  const T* __restrict__ d_k,
+  const T* __restrict__ d_v,
+  T* __restrict__ d_o,
+  int batch_size,
+  int target_seq_len,
+  int src_seq_len,
+  int query_heads,
+  int kv_heads,
+  int head_dim,
+  bool is_causal)
+{
+  const int out_idx = static_cast<int>(blockIdx.x);
+  const int qh_stride = query_heads;
+  const int t_stride = target_seq_len * qh_stride;
+
+  const int b = out_idx / t_stride;
+  const int rem0 = out_idx - b * t_stride;
+  const int t = rem0 / qh_stride;
+  const int qh = rem0 - t * qh_stride;
+  const int tid = threadIdx.x;
+
+  if (b >= batch_size) return;
+
+  int kvh = (query_heads > 0) ? ((qh * kv_heads) / query_heads) : 0;
+  if (kvh >= kv_heads) kvh = kv_heads - 1;
+  if (kvh < 0) kvh = 0;
+
+  int valid_src_len = src_seq_len;
+  if (is_causal)
+  {
+    int visible_len = t + 1;
+    if (visible_len < valid_src_len) valid_src_len = visible_len;
+  }
+
+  if (valid_src_len <= 0 || head_dim <= 0)
+  {
+    for (int d = tid; d < head_dim; d += blockDim.x)
+    {
+      const int o_offset = (((b * target_seq_len + t) * query_heads + qh) * head_dim + d);
+      d_o[o_offset] = from_float<T>(0.0f);
+    }
+    return;
+  }
+
+  using compute_t = typename ComputeType<T>::type;
+
+  extern __shared__ unsigned char smem_raw[];
+  compute_t* s_reduce = reinterpret_cast<compute_t*>(smem_raw);
+
+  compute_t reg_q[8];
+  int q_idx = 0;
+  const int q_base_offset = ((b * target_seq_len + t) * query_heads + qh) * head_dim;
+
+  for (int d = tid; d < head_dim; d += blockDim.x)
+  {
+    if (q_idx < 8)
+    {
+      reg_q[q_idx++] = static_cast<compute_t>(to_float<T>(d_q[q_base_offset + d]));
+    }
+  }
+
+  compute_t m_curr = static_cast<compute_t>(-INFINITY);
+  compute_t l_curr = static_cast<compute_t>(0.0);
+  compute_t acc_o = static_cast<compute_t>(0.0);
+
+  const compute_t scale = static_cast<compute_t>(1.0) /
+    static_cast<compute_t>(sqrt(static_cast<double>(head_dim)));
+
+  const int kv_head_stride = head_dim;
+  const int src_len_stride = kv_heads * head_dim;
+  const int b_stride = src_seq_len * src_len_stride;
+
+  const T* k_base_ptr = d_k + (b * b_stride + kvh * kv_head_stride);
+  const T* v_base_ptr = d_v + (b * b_stride + kvh * kv_head_stride);
+
+  for (int j = 0; j < valid_src_len; ++j)
+  {
+    compute_t dot_val = static_cast<compute_t>(0.0);
+    q_idx = 0;
+    for (int d = tid; d < head_dim; d += blockDim.x)
+    {
+      compute_t val_k = static_cast<compute_t>(to_float<T>(k_base_ptr[j * src_len_stride + d]));
+      if (q_idx < 8)
+      {
+        dot_val += reg_q[q_idx++] * val_k;
+      }
+    }
+
+    s_reduce[tid] = dot_val;
+    __syncthreads();
+
+    for (int offset = blockDim.x >> 1; offset > 0; offset >>= 1)
+    {
+      if (tid < offset)
+      {
+        s_reduce[tid] += s_reduce[tid + offset];
+      }
+      __syncthreads();
+    }
+
+    compute_t score = s_reduce[0] * scale;
+
+    __shared__ compute_t s_P;
+    __shared__ compute_t s_alpha;
+
+    if (tid == 0)
+    {
+      compute_t m_prev = m_curr;
+      m_curr = (score > m_prev) ? score : m_prev;
+      compute_t alpha = expT<compute_t>(m_prev - m_curr);
+      compute_t P = expT<compute_t>(score - m_curr);
+      l_curr = l_curr * alpha + P;
+      s_alpha = alpha;
+      s_P = P;
+    }
+    __syncthreads();
+
+    compute_t alpha = s_alpha;
+    compute_t P = s_P;
+    for (int d = tid; d < head_dim; d += blockDim.x)
+    {
+      compute_t val_v = static_cast<compute_t>(to_float<T>(v_base_ptr[j * src_len_stride + d]));
+      acc_o = acc_o * alpha + P * val_v;
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0)
+  {
+    s_reduce[0] = (l_curr > 0.0f) ? (1.0f / l_curr) : 0.0f;
+  }
+  __syncthreads();
+
+  compute_t inv_l = s_reduce[0];
+  for (int d = tid; d < head_dim; d += blockDim.x)
+  {
+    compute_t final_val = acc_o * inv_l;
+    d_o[q_base_offset + d] = from_float<T>(final_val);
+  }
+}
+
+template <typename T>
+struct FlashAttentionLauncher
+{
+  static void launch(const T* d_q, const T* d_k, const T* d_v, T* d_o,
+    int batch_size, int target_seq_len, int src_seq_len,
+    int query_heads, int kv_heads, int head_dim, bool is_causal,
+    int threads, int blocks)
+  {
+    const size_t shared_bytes = static_cast<size_t>(threads + head_dim) *
+      sizeof(typename ComputeType<T>::type);
+    flashAttentionKernel<T> << <blocks, threads, shared_bytes >> > (
+      d_q, d_k, d_v, d_o,
+      batch_size, target_seq_len, src_seq_len,
+      query_heads, kv_heads, head_dim, is_causal);
+  }
+};
+
+template <>
+struct FlashAttentionLauncher<float>
+{
+  static void launch(const float* d_q, const float* d_k, const float* d_v, float* d_o,
+    int batch_size, int target_seq_len, int src_seq_len,
+    int query_heads, int kv_heads, int head_dim, bool is_causal,
+    int /*threads*/, int blocks)
+  {
+    // 我在 float 路径下会用“并行算点积 + thread0 串行累加”的实现来尽量贴近参考结果。
+    // 这里我额外保证 blockDim.x >= head_dim：
+    // - 这样每个线程最多只负责一个输出维度 d，不会出现 head_dim>256 时写回错误。
+    // - 同时 shared memory 需要缓存 Q(head_dim) + scores(blockDim.x)。
+    int threads_f = 256;
+    while (threads_f < head_dim && threads_f < 1024) threads_f <<= 1;
+    if (threads_f > 1024) threads_f = 1024;
+
+    const size_t smem_bytes = (static_cast<size_t>(head_dim) + static_cast<size_t>(threads_f)) * sizeof(float);
+    flashAttentionKernelFloatOpt << <blocks, threads_f, smem_bytes >> > (
+      d_q, d_k, d_v, d_o,
+      batch_size, target_seq_len, src_seq_len,
+      query_heads, kv_heads, head_dim, is_causal);
+  }
+};
 
 // *********************************************************************
 // Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
